@@ -6,6 +6,8 @@ import matplotlib.gridspec as gridspec
 import numpy as np
 from collections import deque
 import sys
+import csv
+import time
 
 # ================= НАСТРОЙКИ =================
 PORT = "COM12"
@@ -25,12 +27,29 @@ except Exception as e:
     print(f"Ошибка открытия порта: {e}\nУбедись, что закрыл Serial Monitor в Arduino IDE!")
     sys.exit()
 
+# ================= НАСТРОЙКА CSV (ДЛЯ EXCEL) =================
+csv_filename = f"telemetry_log_{int(time.time())}.csv"
+csv_file = open(csv_filename, 'w', newline='')
+writer = csv.writer(csv_file, delimiter=';')  # Точка с запятой - стандарт для русскоязычного Excel
+# Заголовки столбцов:
+writer.writerow([
+    "Real_Acc_X", "Real_Acc_Y", "Real_Acc_Z", "Real_Gyr_X", "Real_Gyr_Y", "Real_Gyr_Z",
+    "Pred_Acc_X", "Pred_Acc_Y", "Pred_Acc_Z", "Pred_Gyr_X", "Pred_Gyr_Y", "Pred_Gyr_Z",
+    "MSE_Loss", "Beam_Error_Deg"
+])
+print(f"Идет постоянная запись данных: {csv_filename}")
+# ==============================================================
+
 real_path = deque(maxlen=MAX_POINTS)
 pred_path = deque(maxlen=MAX_POINTS)
 
-# Координаты кисти на экране (X, Y)
+# Координаты кисти на экране (с DECAY для красивой отрисовки)
 real_pos = np.zeros(2)
 pred_pos = np.zeros(2)
+
+# Истинные пространственные углы без затухания (для физики бимформинга)
+abs_real_pos = np.zeros(2)
+abs_pred_pos = np.zeros(2)
 
 # Последние сырые данные для текст-бокса
 latest_real = np.zeros(6)
@@ -108,18 +127,42 @@ def update(frame):
                 # Использование гироскопа (угловой скорости) дает невероятно плавную "воздушную мышь".
                 # gy (Тангаж - Вниз/Вверх), gz (Рыскание - Влево/Вправо)
 
-                real_dx = latest_real[4] * SCALE_GYR * DT  # Ось Z (Yaw) -> Screen X
-                real_dy = latest_real[5] * SCALE_GYR * DT  # Ось Y (Pitch) -> Screen Y
+                real_dx = latest_real[4] * SCALE_GYR * DT  # Ось Y (Pitch) -> Screen X
+                real_dy = latest_real[5] * SCALE_GYR * DT  # Ось Z (Yaw) -> Screen Y
 
-                # Прибавляем шаг и УМНОЖАЕМ на decay (чтобы курсор плавно возвращался в центр к нулю)
+                # Отрисовочные координаты с затуханием (чтобы курсор плавно возвращался в центр к нулю)
                 real_pos[0] = (real_pos[0] + real_dx) * DECAY
                 real_pos[1] = (real_pos[1] + real_dy) * DECAY
                 real_path.append(real_pos.copy())
-                pred_dx = latest_pred[5] * SCALE_GYR * DT
-                pred_dy = latest_pred[4] * SCALE_GYR * DT
+
+                pred_dx = latest_pred[4] * SCALE_GYR * DT
+                pred_dy = latest_pred[5] * SCALE_GYR * DT
                 pred_pos[0] = (pred_pos[0] + pred_dx) * DECAY
                 pred_pos[1] = (pred_pos[1] + pred_dy) * DECAY
                 pred_path.append(pred_pos.copy())
+
+                # Истинное математическое интегрирование углов (без скейлов и затуханий)
+                abs_real_pos[0] += latest_real[4] * DT
+                abs_real_pos[1] += latest_real[5] * DT
+
+                abs_pred_pos[0] += latest_pred[4] * DT
+                abs_pred_pos[1] += latest_pred[5] * DT
+
+                # Мгновенные подсчеты для таблицы
+                inst_loss = np.mean((latest_real - latest_pred) ** 2)
+
+                # Реальная ПРОСТРАНСТВЕННАЯ ошибка Бимформинга (в градусах)
+                beam_err_deg = np.sqrt((abs_real_pos[0] - abs_pred_pos[0]) ** 2 +
+                                       (abs_real_pos[1] - abs_pred_pos[1]) ** 2)
+
+                # Постоянная дозапись в CSV файл
+                writer.writerow([
+                    round(latest_real[0], 4), round(latest_real[1], 4), round(latest_real[2], 4),
+                    round(latest_real[3], 4), round(latest_real[4], 4), round(latest_real[5], 4),
+                    round(latest_pred[0], 4), round(latest_pred[1], 4), round(latest_pred[2], 4),
+                    round(latest_pred[3], 4), round(latest_pred[4], 4), round(latest_pred[5], 4),
+                    round(inst_loss, 4), round(beam_err_deg, 4)
+                ])
 
                 updated = True
         except Exception:
@@ -152,9 +195,9 @@ def update(frame):
         current_loss = np.mean((latest_real - latest_pred) ** 2)
         text_loss.set_text(f"MSE LOSS: {current_loss:.4f}")
 
-        # Расчет мгновенной пространственной ошибки бимформинга (в градусах)
-        inst_err_deg = np.sqrt((latest_real[4] - latest_pred[4]) ** 2 + (latest_real[5] - latest_pred[5]) ** 2) * DT
-        error_history.append(inst_err_deg)
+        # График пространственной ошибки бимформинга
+        current_beam_err = np.sqrt((abs_real_pos[0] - abs_pred_pos[0]) ** 2 + (abs_real_pos[1] - abs_pred_pos[1]) ** 2)
+        error_history.append(current_beam_err)
         line_err.set_ydata(error_history)
 
     return line_real, line_pred, point_real, point_pred, text_real_acc, text_real_gyr, text_pred_acc, text_pred_gyr, text_loss, line_err
@@ -164,4 +207,8 @@ ani = animation.FuncAnimation(fig, update, interval=20, blit=False, cache_frame_
 plt.subplots_adjust(left=0.05, right=0.98, top=0.9, bottom=0.1)  # Сдвигаем графики для красоты
 plt.show()
 
+# Закрываем порты и файлы при закрытии окна крестиком
 ser.close()
+csv_file.close()
+print(f"Файл {csv_filename} успешно сохранен!")
+
