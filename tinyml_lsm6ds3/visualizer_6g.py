@@ -1,155 +1,241 @@
 import serial
+import serial.tools.list_ports
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import matplotlib.gridspec as gridspec
 import numpy as np
 from collections import deque
+import sys
 import csv
 import time
-import os
 
 # ================= НАСТРОЙКИ =================
-PORT = "COM12"
 BAUD_RATE = 115200
-MAX_SUITS = 3  # Сколько максимум костюмов выводить на экран
-MAX_POINTS = 50  # Длина хвоста траектории
+
+MAX_POINTS = 50  # Длина "хвоста" траектории (чем меньше, тем быстрее стирается)
 DT = 0.01
-DECAY = 0.95
-SCALE_GYR = 0.5
-# =============================================
 
-if not os.path.exists('suit_logs'):
-    os.makedirs('suit_logs')
+DECAY = 0.95  # Затухание (возвращает кисть в центр, убирает вечный дрифт)
+SCALE_GYR = 0.5  # Масштаб отрисовки на графике
 
+# ================= АВТОПОИСК COM-ПОРТОВ =================
+import serial.tools.list_ports
+ports_info = list(serial.tools.list_ports.comports())
+available_ports = [p.device for p in ports_info if "USB" in p.description or "CH340" in p.description or "CP210" in p.description or "Serial" in p.description]
+if not available_ports: # Fallback если фильтр не сработал
+    available_ports = [p.device for p in ports_info]
+    
+print(f"Найдены активные порты: {available_ports}")
 
-class SuitProcessor:
-    """Класс для обработки данных конкретного узла/костюма"""
+ser_list = []
+for p in available_ports:
+    try:
+        s = serial.Serial(p, BAUD_RATE, timeout=0.01)
+        ser_list.append(s)
+        print(f"Успешно подключено к: {p}")
+    except Exception as e:
+        print(f"Пропущен порт {p}: {e}")
 
-    def __init__(self, suit_id, index):
-        self.suit_id = suit_id
-        self.index = index
+if not ser_list:
+    print("Не удалось открыть ни один COM-порт! Закройте Serial Monitor в Arduino IDE!")
+    sys.exit()
 
-        # Данные траектории
-        self.real_path = deque(maxlen=MAX_POINTS)
-        self.pred_path = deque(maxlen=MAX_POINTS)
-        self.real_pos = np.zeros(2)
-        self.pred_pos = np.zeros(2)
-        self.abs_real_pos = np.zeros(2)
-        self.abs_pred_pos = np.zeros(2)
+# ================= НАСТРОЙКА CSV (ДЛЯ EXCEL) =================
+csv_filename = f"telemetry_log_{int(time.time())}.csv"
+csv_file = open(csv_filename, 'w', newline='')
+writer = csv.writer(csv_file, delimiter=';') # Точка с запятой - стандарт для русскоязычного Excel
+# Заголовки столбцов:
+writer.writerow([
+    "Client_ID", 
+    "Real_Acc_X", "Real_Acc_Y", "Real_Acc_Z", "Real_Gyr_X", "Real_Gyr_Y", "Real_Gyr_Z",
+    "Pred_Acc_X", "Pred_Acc_Y", "Pred_Acc_Z", "Pred_Gyr_X", "Pred_Gyr_Y", "Pred_Gyr_Z",
+    "MSE_Loss", "Beam_Error_Deg"
+])
+print(f"Идет постоянная запись мульти-данных: {csv_filename}")
+# ==============================================================
 
-        # Ошибки
-        self.error_history = deque([0] * 100, maxlen=100)
-        self.latest_loss = 0
-        self.latest_beam_err = 0
+# Мульти-клиентная структура данных
+clients = {}
+colors_real = ['b', 'g', 'c', 'm', 'k'] # Цвета для реальных траекторий
+colors_pred = ['r', 'orange', 'y', 'pink', 'purple'] # Цвета для ИИ
 
-        # Создание персонального CSV
-        self.filename = f"suit_logs/log_{suit_id}_{int(time.time())}.csv"
-        self.csv_file = open(self.filename, 'w', newline='')
-        self.writer = csv.writer(self.csv_file, delimiter=';')
-        self.writer.writerow(["R_AccX", "R_AccY", "R_AccZ", "R_GyrX", "R_GyrY", "R_GyrZ",
-                              "P_AccX", "P_AccY", "P_AccZ", "P_GyrX", "P_GyrY", "P_GyrZ", "MSE", "BeamErr"])
+# Настройка графического окна
+fig = plt.figure(figsize=(14, 8))
+fig.canvas.manager.set_window_title('6G Federated TinyML - Multi-Client Supervisor')
+gs = gridspec.GridSpec(4, 4)
 
-    def update_data(self, vals):
-        latest_real = vals[0:6]
-        latest_pred = vals[6:12]
+# --- ЛЕВАЯ ЧАСТЬ (Траектория) ---
+ax_traj = fig.add_subplot(gs[0:3, :3])
+ax_traj.grid(True, linestyle=':', alpha=0.6)
+ax_traj.set_title("Траектории координации костюмов (Живой эфир)", fontsize=16)
+ax_traj.set_xlabel('Рыскание / Слева-Направо (X)')
+ax_traj.set_ylabel('Тангаж / Снизу-Вверх (Y)')
+ax_traj.set_facecolor('#f4f4f4')
 
-        # Интегрирование траектории (Гироскоп)
-        dx_r, dy_r = latest_real[4] * SCALE_GYR * DT, latest_real[5] * SCALE_GYR * DT
-        self.real_pos = (self.real_pos + [dx_r, dy_r]) * DECAY
-        self.real_path.append(self.real_pos.copy())
+# --- НИЖНЯЯ ЧАСТЬ (Оценка Бимформинга 6G) ---
+ax_beam = fig.add_subplot(gs[3, :3])
+ax_beam.axhspan(0, 5, facecolor='green', alpha=0.2, label='Зона захвата 6G (< 5°)')
+ax_beam.axhline(5, color='darkgreen', linestyle='--', linewidth=1.5)
+ax_beam.set_xlim(0, 200)
+ax_beam.set_ylim(0, 15)  # Расширенная шкала ошибки
+ax_beam.set_title("Оценка точности наведения ФАР луча для всех устройств", fontsize=11, weight='bold')
+ax_beam.set_ylabel('Ошибка (°)')
+ax_beam.set_xlabel('Фреймы')
+ax_beam.legend(loc='upper right', fontsize=9)
+ax_beam.grid(True, linestyle=':', alpha=0.6)
 
-        dx_p, dy_p = latest_pred[4] * SCALE_GYR * DT, latest_pred[5] * SCALE_GYR * DT
-        self.pred_pos = (self.pred_pos + [dx_p, dy_p]) * DECAY
-        self.pred_path.append(self.pred_pos.copy())
+# --- ПРАВАЯ ЧАСТЬ (Телеметрия) ---
+ax_info = fig.add_subplot(gs[:, 3])
+ax_info.axis('off')
 
-        # Истинные углы (для бимформинга)
-        self.abs_real_pos += [latest_real[4] * DT, latest_real[5] * DT]
-        self.abs_pred_pos += [latest_pred[4] * DT, latest_pred[5] * DT]
+# Заголовки
+text_real_title = ax_info.text(0.0, 0.95, "РЕАЛЬНЫЙ ДАТЧИК", weight='bold', color='blue', fontsize=12)
+text_real_acc = ax_info.text(0.0, 0.78, "ACC:", fontsize=11, family='monospace')
+text_real_gyr = ax_info.text(0.0, 0.61, "GYR:", fontsize=11, family='monospace')
 
-        self.latest_loss = np.mean((latest_real - latest_pred) ** 2)
-        self.latest_beam_err = np.sqrt(np.sum((self.abs_real_pos - self.abs_pred_pos) ** 2))
-        self.error_history.append(self.latest_beam_err)
+text_pred_title = ax_info.text(0.0, 0.45, "ПРЕДСКАЗАННОЕ", weight='bold', color='red', fontsize=12)
+text_pred_acc = ax_info.text(0.0, 0.28, "ACC:", fontsize=11, family='monospace')
+text_pred_gyr = ax_info.text(0.0, 0.11, "GYR:", fontsize=11, family='monospace')
 
-        # Запись в лог
-        self.writer.writerow(list(latest_real) + list(latest_pred) + [self.latest_loss, self.latest_beam_err])
-
-
-# --- ИНИЦИАЛИЗАЦИЯ ИНТЕРФЕЙСА ---
-fig = plt.figure(figsize=(16, 9))
-gs = gridspec.GridSpec(2, MAX_SUITS)
-suits = {}  # Словарь для хранения объектов SuitProcessor
-
-# Подготовка пустых осей (на MAX_SUITS устройств)
-traj_axes = []
-err_axes = []
-lines_real = [];
-lines_pred = [];
-lines_err = []
-
-for i in range(MAX_SUITS):
-    # Верхний ряд - траектории
-    ax = fig.add_subplot(gs[0, i])
-    ax.set_title(f"Suit Slot {i + 1}: Waiting...")
-    lr, = ax.plot([], [], 'b-', lw=2, label='Real')
-    lp, = ax.plot([], [], 'r--', lw=1, label='AI Pred')
-    ax.set_xlim(-5, 5);
-    ax.set_ylim(-5, 5)
-    ax.grid(True, alpha=0.2)
-    traj_axes.append(ax)
-    lines_real.append(lr);
-    lines_pred.append(lp)
-
-    # Нижний ряд - ошибки бимформинга
-    ax_e = fig.add_subplot(gs[1, i])
-    le, = ax_e.plot(range(100), [0] * 100, 'g-')
-    ax_e.set_ylim(0, 15);
-    ax_e.set_title("Beam Error (°)")
-    err_axes.append(ax_e)
-    lines_err.append(le)
-
-ser = serial.Serial(PORT, BAUD_RATE, timeout=0.01)
+bbox_props = dict(boxstyle="round,pad=0.3", fc="white", ec="black", lw=1)
+text_loss = ax_info.text(0.0, -0.05, "MSE LOSS: 0.0000", color='green', weight='bold', fontsize=12, bbox=bbox_props)
 
 
-def animate(frame):
-    while ser.in_waiting:
-        line = ser.readline().decode('utf-8', errors='ignore').strip()
-        parts = line.split(',')
+def update(frame):
+    updated = False
+    artists = [] # Список графических элементов для обновления
 
-        # Ожидаем формат: ID, R_AccX, ..., P_GyrZ (всего 13 значений)
-        if len(parts) == 13:
-            suit_id = parts[0]
-            vals = np.array([float(p) for p in parts[1:]])
+    for ser in ser_list:
+        while ser.in_waiting:
+            try:
+                line = ser.readline().decode('utf-8').strip()
 
-            if suit_id not in suits and len(suits) < MAX_SUITS:
-                suits[suit_id] = SuitProcessor(suit_id, len(suits))
-                traj_axes[suits[suit_id].index].set_title(f"Device: {suit_id}")
+                if not line or "nan" in line.lower() or "Init" in line or line.startswith(("#", "I")):
+                    continue
 
-            if suit_id in suits:
-                suits[suit_id].update_data(vals)
+                parts = line.split(',')
+                if len(parts) == 13:  # Теперь мы ждем 13 столбцов (1 строка ID + 12 чисел)
+                    client_id = parts[0].strip()
+                    vals = np.array([float(p) for p in parts[1:]])
+                    
+                    # Динамическое создание нового клиента, если мы его еще не видели
+                    if client_id not in clients:
+                        c_idx = len(clients) % len(colors_real)
+                        c_real = colors_real[c_idx]
+                        c_pred = colors_pred[c_idx]
+                        
+                        lr, = ax_traj.plot([], [], color=c_real, linestyle='-', linewidth=3, label=f'{client_id} (Real)')
+                        lp, = ax_traj.plot([], [], color=c_pred, linestyle='--', linewidth=2, label=f'{client_id} (Pred)')
+                        pr, = ax_traj.plot([], [], color=c_real, marker='o', markersize=8)
+                        pp, = ax_traj.plot([], [], color=c_pred, marker='o', markersize=6)
+                        le, = ax_beam.plot(range(200), [0]*200, color=c_pred, linewidth=2, label=f'Ошибка {client_id}')
+                        
+                        ax_traj.legend(loc='upper right', fontsize=8)
+                        ax_beam.legend(loc='upper right', fontsize=8)
+                        
+                        clients[client_id] = {
+                            'real_path': deque(maxlen=MAX_POINTS),
+                            'pred_path': deque(maxlen=MAX_POINTS),
+                            'real_pos': np.zeros(2),
+                            'pred_pos': np.zeros(2),
+                            'abs_real_pos': np.zeros(2),
+                            'abs_pred_pos': np.zeros(2),
+                            'latest_real': np.zeros(6),
+                            'latest_pred': np.zeros(6),
+                            'error_history': deque([0] * 200, maxlen=200),
+                            'artists': (lr, lp, pr, pp, le)
+                        }
+                        
+                    c = clients[client_id]
+                    c['latest_real'] = vals[0:6]
+                    c['latest_pred'] = vals[6:12]
 
-    # Отрисовка всех активных устройств
-    for sid, suit in suits.items():
-        if len(suit.real_path) > 0:
-            rx, ry = zip(*suit.real_path)
-            px, py = zip(*suit.pred_path)
+                # --- ИДЕАЛЬНЫЙ РАСЧЕТ ТРАЕКТОРИИ (Только Гироскоп) ---
+                # Использование гироскопа (угловой скорости) дает невероятно плавную "воздушную мышь".
+                # gy (Тангаж - Вниз/Вверх), gz (Рыскание - Влево/Вправо)
 
-            lines_real[suit.index].set_data(rx, ry)
-            lines_pred[suit.index].set_data(px, py)
-            lines_err[suit.index].set_ydata(suit.error_history)
+                    real_dx = c['latest_real'][4] * SCALE_GYR * DT  
+                    real_dy = c['latest_real'][5] * SCALE_GYR * DT  
 
-            # Автомасштаб
-            max_v = max(np.max(np.abs(suit.real_path)), 2.0) * 1.2
-            traj_axes[suit.index].set_xlim(-max_v, max_v)
-            traj_axes[suit.index].set_ylim(-max_v, max_v)
+                    c['real_pos'][0] = (c['real_pos'][0] + real_dx) * DECAY
+                    c['real_pos'][1] = (c['real_pos'][1] + real_dy) * DECAY
+                    c['real_path'].append(c['real_pos'].copy())
+                    
+                    pred_dx = c['latest_pred'][4] * SCALE_GYR * DT
+                    pred_dy = c['latest_pred'][5] * SCALE_GYR * DT
+                    c['pred_pos'][0] = (c['pred_pos'][0] + pred_dx) * DECAY
+                    c['pred_pos'][1] = (c['pred_pos'][1] + pred_dy) * DECAY
+                    c['pred_path'].append(c['pred_pos'].copy())
+                    
+                    c['abs_real_pos'][0] += c['latest_real'][4] * DT
+                    c['abs_real_pos'][1] += c['latest_real'][5] * DT
+                    
+                    c['abs_pred_pos'][0] += c['latest_pred'][4] * DT
+                    c['abs_pred_pos'][1] += c['latest_pred'][5] * DT
+                    
+                    inst_loss = np.mean((c['latest_real'] - c['latest_pred']) ** 2)
+                    
+                    beam_err_deg = np.sqrt((c['abs_real_pos'][0] - c['abs_pred_pos'][0]) ** 2 + 
+                                           (c['abs_real_pos'][1] - c['abs_pred_pos'][1]) ** 2)
+                    
+                    writer.writerow([
+                        client_id,
+                        round(c['latest_real'][0], 4), round(c['latest_real'][1], 4), round(c['latest_real'][2], 4),
+                        round(c['latest_real'][3], 4), round(c['latest_real'][4], 4), round(c['latest_real'][5], 4),
+                        round(c['latest_pred'][0], 4), round(c['latest_pred'][1], 4), round(c['latest_pred'][2], 4),
+                        round(c['latest_pred'][3], 4), round(c['latest_pred'][4], 4), round(c['latest_pred'][5], 4),
+                        round(inst_loss, 4), round(beam_err_deg, 4)
+                    ])
 
-    return lines_real + lines_pred + lines_err
+                    updated = True
+                    
+                    # Обновляем текст (для последнего пришедшего клиента, чтобы не было мешанины)
+                    text_real_title.set_text(f"РЕАЛЬНЫЙ ДАТЧИК ({client_id})")
+                    text_real_acc.set_text(f"ACC (ускорение):\n  X: {c['latest_real'][0]: 5.2f} G\n  Y: {c['latest_real'][1]: 5.2f} G\n  Z: {c['latest_real'][2]: 5.2f} G")
+                    text_real_gyr.set_text(f"GYR (вращение):\n  X: {c['latest_real'][3]: 6.1f}°/s\n  Y: {c['latest_real'][4]: 6.1f}°/s\n  Z: {c['latest_real'][5]: 6.1f}°/s")
+                    
+                    text_pred_acc.set_text(f"ACC (ускорение):\n  X: {c['latest_pred'][0]: 5.2f} G\n  Y: {c['latest_pred'][1]: 5.2f} G\n  Z: {c['latest_pred'][2]: 5.2f} G")
+                    text_pred_gyr.set_text(f"GYR (вращение):\n  X: {c['latest_pred'][3]: 6.1f}°/s\n  Y: {c['latest_pred'][4]: 6.1f}°/s\n  Z: {c['latest_pred'][5]: 6.1f}°/s")
+                    text_loss.set_text(f"MSE LOSS: {inst_loss:.4f}\nBEAM ERROR: {beam_err_deg:.2f}°")
+
+            except Exception as e:
+                pass
+
+    if updated:
+        global_max_bound = 10.0
+        for client_id, c in clients.items():
+            if len(c['real_path']) > 0:
+                rx, ry = zip(*c['real_path'])
+                px, py = zip(*c['pred_path'])
+
+                c['artists'][0].set_data(rx, ry)
+                c['artists'][1].set_data(px, py)
+                c['artists'][2].set_data([rx[-1]], [ry[-1]])
+                c['artists'][3].set_data([px[-1]], [py[-1]])
+                
+                c['error_history'].append(np.sqrt((c['abs_real_pos'][0] - c['abs_pred_pos'][0]) ** 2 + 
+                                                  (c['abs_real_pos'][1] - c['abs_pred_pos'][1]) ** 2))
+                c['artists'][4].set_ydata(c['error_history'])
+                
+                artists.extend(c['artists'])
+                
+                max_b = max(np.max(np.abs(c['real_path'])), np.max(np.abs(c['pred_path']))) * 1.2
+                if max_b > global_max_bound:
+                    global_max_bound = max_b
+
+        ax_traj.set_xlim(-global_max_bound, global_max_bound)
+        ax_traj.set_ylim(-global_max_bound, global_max_bound)
+        artists.extend([text_real_title, text_real_acc, text_real_gyr, text_pred_acc, text_pred_gyr, text_loss])
+
+    return artists
 
 
-ani = animation.FuncAnimation(fig, animate, interval=30, blit=False)
-plt.tight_layout()
+ani = animation.FuncAnimation(fig, update, interval=20, blit=False, cache_frame_data=False)
+plt.subplots_adjust(left=0.05, right=0.98, top=0.9, bottom=0.1)  # Сдвигаем графики для красоты
 plt.show()
 
-# Закрытие файлов
-for s in suits.values():
-    s.csv_file.close()
-ser.close()
+# Закрываем порты и файлы при закрытии окна крестиком
+for s in ser_list:
+    s.close()
+csv_file.close()
+print(f"Файл {csv_filename} успешно сохранен!")

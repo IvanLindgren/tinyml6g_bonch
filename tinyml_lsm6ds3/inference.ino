@@ -186,8 +186,8 @@ void loop() {
     float pred[NUM_PREDICTIONS];
     /* float loss = */ learner_step(tfl_out->data.f, gt, pred);
 
-    Serial.printf("%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
-              client_id, ax, ay, az, gx, gy, gz, 
+    Serial.printf("%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+              CLIENT_ID, ax, ay, az, gx, gy, gz, 
               pred[0], pred[1], pred[2], pred[3], pred[4], pred[5]);
 
     //7. Синхронизация весов (раз в SYNC_INTERVAL_MS) ──
