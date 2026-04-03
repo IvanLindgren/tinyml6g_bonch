@@ -13,7 +13,8 @@
  */
 //Импорт модулей 
 #include <Wire.h>
-#include <FastIMU.h>
+#include <WiFiUdp.h>
+#include "sensor_driver.h"
 
 #include <TensorFlowLite_ESP32.h>
 #include <tensorflow/lite/micro/all_ops_resolver.h>
@@ -39,11 +40,11 @@ TfLiteTensor*              tfl_out    = nullptr;
 tflite::AllOpsResolver     tfl_resolver;
 tflite::MicroErrorReporter tfl_reporter;
 
-    //Датчик
-    LSM6DS3 IMU;
-    calData calib = { 0 };
+// Экземпляр датчика
+Sensor* sensor = nullptr;
+WiFiUDP udp;
 
-//Кольцевой буфер входных данных
+// Кольцевой буфер входных данных
 float ring_buf[NUM_INPUTS];
 int   ring_head     = 0;
 bool  ring_full     = false;
@@ -59,29 +60,13 @@ void setup() {
     // 1. Сеть
     network_setup();
 
-    // 2. Датчик (FastIMU)
-    Serial.println("Init I2C + FastIMU (LSM6DS3)...");
-    Wire.begin();
+    sensor = new Sensor("ADXL");
     
-    int err = IMU.init(calib, 0x6A);
-    if (err != 0) {
-        Serial.println("LSM6DS3 не найден на адресе 0x6A. Пробуем 0x6B...");
-        err = IMU.init(calib, 0x6B);
-        if (err != 0) {
-            Serial.println("Ошибка инициализации LSM6DS3! Проверьте провода SDA/SCL и питание.");
-            while (1) delay(1000); // Останавливаем выполнение
-        }
+    if (!sensor->init()) {
+        Serial.println("Ошибка инициализации сенсора! Проверьте I2C.");
+        while (1) delay(1000);
     }
-    Serial.println("Датчик LSM6DS3 успешно подключен!");
-    
-    // Настраиваем нужные нам диапазоны
-    IMU.setAccelRange(2);  // +- 2G
-    IMU.setGyroRange(250); // +- 250 градусов/с
-    
-    // КАЛИБРОВКА НУЛЕЙ
-    Serial.println("Оставьте плату неподвижно на столе на 2-3 секунды для калибровки...");
-    IMU.calibrateAccelGyro(&calib);
-    Serial.println("Калибровка завершена!");
+    Serial.printf(" Датчик [%s] успешно подключен и откалиброван!\n", sensor->getName().c_str());
 
     // 3. TFLite backbone
     Serial.println("Loading TFLite backbone...");
@@ -127,14 +112,9 @@ void loop() {
     tick_ms = millis();
 
     // ── 1. Чтение датчика ──
-    IMU.update(); // Обновляем данные с шины I2C
-    AccelData accel;
-    GyroData gyro;
-    
-    IMU.getAccel(&accel);
-    IMU.getGyro(&gyro);
-    
-    float raw[6] = {accel.accelX, accel.accelY, accel.accelZ, gyro.gyroX, gyro.gyroY, gyro.gyroZ};
+    sensor->update();
+    float raw[6] = {0, 0, 0, 0, 0, 0};
+    sensor->getRawData(raw); // Метод сам знает сколько осей читать
     
     // ── 1.5 Нормализация на лету (Standard Scaler EWMA) ──
     static float mean[6] = {0};
@@ -149,7 +129,6 @@ void loop() {
         norm[i] = (raw[i] - mean[i]) / (sqrtf(var[i]) + 1e-6f); // Избегаем деления на ноль
     }
     
-    // Для визуализатора и реальных таргетов нужны "сырые" данные:
     float ax = raw[0];
     float ay = raw[1];
     float az = raw[2];
@@ -186,9 +165,16 @@ void loop() {
     float pred[NUM_PREDICTIONS];
     /* float loss = */ learner_step(tfl_out->data.f, gt, pred);
 
-    Serial.printf("%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
-              CLIENT_ID, ax, ay, az, gx, gy, gz, 
-              pred[0], pred[1], pred[2], pred[3], pred[4], pred[5]);
+    //5. Телеметрия по UDP 
+    char udp_buf[256];
+    
+    snprintf(udp_buf, sizeof(udp_buf), "%s,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+             CLIENT_ID, sensor->getName().c_str(), ax, ay, az, gx, gy, gz, 
+             pred[0], pred[1], pred[2], pred[3], pred[4], pred[5]);
+    
+    udp.beginPacket(UDP_TARGET_IP, UDP_TARGET_PORT);
+    udp.print(udp_buf);
+    udp.endPacket();
 
     //7. Синхронизация весов (раз в SYNC_INTERVAL_MS) ──
     if (millis() - sync_ms > SYNC_INTERVAL_MS) {

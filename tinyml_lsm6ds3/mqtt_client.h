@@ -97,14 +97,6 @@ void network_publish_weights() {
     }
 }
 
-// ─────────────── Отправка телеметрии (CSV) ───────────────
-void network_publish_data(float ax, float ay, float az, float gx, float gy, float gz,
-                          const float pred[NUM_PREDICTIONS]) {
-    if (!mqttClient.connected()) return;
-    char buf[256];
-    snprintf(buf, sizeof(buf), "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
-             ax, ay, az, gx, gy, gz, pred[0], pred[1], pred[2], pred[3], pred[4], pred[5]);
-    mqttClient.publish(TOPIC_DATA, buf);
-}
+// MQTT телеметрия удалена (перенесено на быстрый UDP)
 
 #endif // MQTT_CLIENT_H

@@ -8,8 +8,8 @@
 #define CONFIG_H
 
 // ====================== СЕТЬ ======================
-#define WIFI_SSID       "TP-Link_F04D"
-#define WIFI_PASSWORD   "96260272"
+#define WIFI_SSID       ""
+#define WIFI_PASSWORD   ""
 #define MQTT_BROKER     "broker.emqx.io"
 #define MQTT_PORT       1883
 #define MQTT_BUF_SIZE   1024   // PubSubClient default=256, наш payload=792
@@ -18,7 +18,10 @@
 #define CLIENT_ID       "suit1"
 #define TOPIC_LOCAL     "6g_lab/suit1/local_weights"
 #define TOPIC_GLOBAL    "6g_lab/global_weights"
-#define TOPIC_DATA      "6g_lab/suit1/data"
+
+// ====================== UDP TELEMETRY ======================
+#define UDP_TARGET_IP   "255.255.255.255" // Broadcast (автоматически найдет ПК), либо укажите точный IP (например "192.168.0.104")
+#define UDP_TARGET_PORT 5005
 
 // ====================== МОДЕЛЬ ======================
 #define NUM_INPUTS          300   // 50 тиков × 6 осей
@@ -28,9 +31,9 @@
 #define TENSOR_ARENA_KB     16    // Размер арены TFLite (КБ)
 
 // ====================== ОБУЧЕНИЕ ======================
-#define LEARNING_RATE       0.05f
-#define GRADIENT_CLIP       2.0f    // Порог клиппинга для стабильности
-#define SYNC_INTERVAL_MS    10000   // Интервал отправки весов (мс)
+#define LEARNING_RATE       0.002f  
+#define GRADIENT_CLIP       0.5f    
+#define SYNC_INTERVAL_MS    10000   
 
 // ====================== ДАТЧИК ======================
 #define SAMPLE_INTERVAL_MS  10      // 10 мс = 100 Гц
