@@ -59,6 +59,7 @@ void setup() {
     delay(2000);
     // 1. Сеть
     network_setup();
+    Serial.printf("ESP32 IP Address: %s\n", WiFi.localIP().toString().c_str());
 
     sensor = new Sensor("ADXL");
     
@@ -100,6 +101,8 @@ void setup() {
 
     Serial.printf("Arena: %d / %d bytes\n",
                    tfl_interp->arena_used_bytes(), kArenaSize);
+                   
+    udp.begin(UDP_TARGET_PORT); // КРИТИЧЕСКИ ВАЖНО: без этого UDP пакеты не уйдут в сеть
     Serial.println("SYSTEM_ONLINE");
 }
 
@@ -176,9 +179,16 @@ void loop() {
     udp.print(udp_buf);
     udp.endPacket();
 
+    static int udp_count = 0;
+    if (++udp_count >= 100) {
+        udp_count = 0;
+        Serial.println(">>> UDP Packet Broadcasted");
+    }
+
     //7. Синхронизация весов (раз в SYNC_INTERVAL_MS) ──
     if (millis() - sync_ms > SYNC_INTERVAL_MS) {
         sync_ms = millis();
         network_publish_weights();
+        delay(100); // Небольшая пауза после тяжелой сетевой операции для стабильности
     }
 }

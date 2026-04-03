@@ -8,8 +8,8 @@
 #define CONFIG_H
 
 // ====================== СЕТЬ ======================
-#define WIFI_SSID       ""
-#define WIFI_PASSWORD   ""
+#define WIFI_SSID       "POCO X5 Pro 5G"
+#define WIFI_PASSWORD   "123456789"
 #define MQTT_BROKER     "broker.emqx.io"
 #define MQTT_PORT       1883
 #define MQTT_BUF_SIZE   1024   // PubSubClient default=256, наш payload=792
@@ -20,7 +20,7 @@
 #define TOPIC_GLOBAL    "6g_lab/global_weights"
 
 // ====================== UDP TELEMETRY ======================
-#define UDP_TARGET_IP   "255.255.255.255" // Broadcast (автоматически найдет ПК), либо укажите точный IP (например "192.168.0.104")
+#define UDP_TARGET_IP   "10.223.86.51" // Точный IP-адрес вашего компьютера в текущей Wi-Fi сети
 #define UDP_TARGET_PORT 5005
 
 // ====================== МОДЕЛЬ ======================
